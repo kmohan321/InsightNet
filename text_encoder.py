@@ -25,33 +25,13 @@ class Rope(nn.Module):
         return self.complex_freq
 
 def apply_rope(x,complex_freq):
-    b ,s, d = x.shape
-    x = x.view(b, s, -1, 2)
+    b ,s, h,d = x.shape
+    x = x.view(b, s, h,-1, 2)
     x = torch.view_as_complex(x)
  
-    x = x * complex_freq[:,:s,:].squeeze(2)
+    x = x * complex_freq[:,:s,:,:]
     x = torch.view_as_real(x)
-    x = x.view(b,s,d)
-    return x
-    
-
-class Patchifier(nn.Module):
-  def __init__(self,
-               in_channels:int,
-               height:int,
-               hidden_dim:int,
-               patch_size:int
-               ):
-    super().__init__()
-    self.hidden_dim = hidden_dim
-    
-    self.conv = nn.Conv2d(in_channels, out_channels=hidden_dim, kernel_size=patch_size, stride=patch_size)
-    self.num_patches = (height//patch_size) **2
-    
-  def forward(self,x,complex_freq):
-    x = self.conv(x)
-    x = x.permute(0,2,3,1).contiguous().view(-1,self.num_patches ,self.hidden_dim)
-    x = apply_rope(x,complex_freq)
+    x = x.view(b,s,h,d)
     return x
 
 class MHA(nn.Module):
@@ -72,13 +52,15 @@ class MHA(nn.Module):
     
     self.scale = self.head_dim ** -0.5
     
-  def forward(self,x):
+  def forward(self,x,rope_freq):
     
     b,s,d = x.shape
     #(b,s,d) -> (b,s,n_h,h_d)
     q,k = self.Wq(x).view(-1,s,self.num_heads,self.head_dim), self.Wk(x).view(-1,s,self.num_heads,self.head_dim)
     v = self.Wv(x).view(-1,s,self.num_heads,self.head_dim)
     
+    #applying the rope values
+    q,k = apply_rope(q,rope_freq),apply_rope(k,rope_freq)
     #(b,s,n_h,h_d) -> (b,h_d,s,h_d)
     q,k,v = q.transpose(1,2),k.transpose(1,2),v.transpose(1,2)
     
@@ -87,57 +69,53 @@ class MHA(nn.Module):
     out = torch.einsum('bhss,bhsd->bhsd',attention_weights,v).transpose(1,2).contiguous().view(-1,s,self.hidden_dim)
     
     return self.Wo(out)
-    
-    
-class Encoder_blocks(nn.Module):
+
+class Encoder(nn.Module):
   def __init__(self,
                hidden_dim: int,
-               num_heads: int,
-               head_dim: int,
-               mlp_multiplier: int
+               num_heads:int,
+               head_dim:int,
+               mlp_mlt:int
                ):
     super().__init__()
     
+    self.mha = MHA(hidden_dim,num_heads,head_dim)
     self.layer_norm1 = nn.LayerNorm(hidden_dim)
     self.layer_norm2 = nn.LayerNorm(hidden_dim)
     
-    self.mha = MHA(hidden_dim,num_heads,head_dim)
-    self.ffn = nn.Sequential(
-      nn.Linear(hidden_dim,hidden_dim * mlp_multiplier),
-      nn.GELU(),
-      nn.Linear(hidden_dim * mlp_multiplier , hidden_dim)
-    )
-  def forward(self,x):
-    x = x + self.mha(self.layer_norm1(x))
-    x = x + self.ffn(self.layer_norm2(x))
-    return x
+    self.ffn =nn.Sequential(
+        nn.Linear(hidden_dim,mlp_mlt*hidden_dim),
+        nn.GELU(),
+        nn.Linear(mlp_mlt*hidden_dim,hidden_dim)
+       )
     
+  def forward(self,x,rope_freq):
+    x = x + self.layer_norm1(self.mha(x,rope_freq))
+    x = x + self.layer_norm2(self.ffn(x))
+    return x
 
-class VisualEncoder(nn.Module):
+class TextEncoder(nn.Module):
   def __init__(self,
-                in_channels:int,
-                height:int,
-                patch_size:int,
-                num_blocks: int,
-                hidden_dim:int,
-                max_seq_length:int,
+                num_blocks:int,
+                hidden_dim: int,
                 num_heads:int,
-                head_dim : int,
-                mlp_multiplier: int
-                ):
+                head_dim:int,
+                mlp_mlt:int,
+                max_seq_length:int
+               ):
     super().__init__()
     
-    self.rope = Rope(max_seq_length,hidden_dim)
-    self.patchifier = Patchifier(in_channels, height,hidden_dim, patch_size)
-    self.encoder_blocks = nn.ModuleList([Encoder_blocks(hidden_dim,num_heads,head_dim,mlp_multiplier) 
-                                         for _ in range(num_blocks)])
+    self.blocks = nn.ModuleList([Encoder(hidden_dim,num_heads,head_dim,mlp_mlt) for _ in range(num_blocks)])
+    self.rope = Rope(max_seq_length,head_dim)
     
-  def forward(self, x):
+  def forward(self,x):
+
+      complex_freq = self.rope()
+      for block in self.blocks:
+        x = block(x,complex_freq)
+      return x
+ 
+  
+
     
-    complex_freq = self.rope()
-    x = self.patchifier(x,complex_freq)
-    
-    for block in self.encoder_blocks:
-      x = block(x)
-    return x
     
